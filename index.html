@@ -111,6 +111,10 @@
   a.link{color:var(--brand);text-decoration:none;font-weight:600}
   .center{text-align:center}
   .spacer{height:8px}
+  #staleBanner{display:block;text-decoration:none;margin:12px 0 0;padding:12px 14px;border-radius:14px;
+    background:#fff4e5;border:1px solid #f5c98a;color:#8a5300;font-size:13.5px;font-weight:600;line-height:1.5}
+  #staleBanner b{color:#b45309}
+  #staleBanner .go{display:inline-block;margin-top:2px;color:#b45309;text-decoration:underline}
 </style>
 </head>
 <body>
@@ -128,6 +132,8 @@
 </header>
 
 <div class="wrap">
+
+  <a id="staleBanner" style="display:none" target="_blank" rel="noopener"></a>
 
   <!-- ===== 儀表板 ===== -->
   <section class="page on" id="pg-dash">
@@ -620,7 +626,21 @@ function renderPie(){
 }
 
 function renderCharts(){ renderGrowth(); renderPie(); }
-function renderAll(){ recordSnapshot(); renderCodePicker(); renderDash(); renderOverview(); renderTx(); renderPriceEditor(); renderCharts(); }
+
+/* ---------- 股價太久沒更新 → 跳提示，一鍵去喚醒排程（免記憶） ---------- */
+const WAKE_URL='https://github.com/p892508306-dev/cunggu/actions/workflows/update-prices.yml';
+function renderFreshness(){
+  const el=$('#staleBanner');
+  const autoDates=db.codes.filter(c=>c.auto && c.priceDate).map(c=>dnum(c.priceDate));
+  if(!autoDates.length){ el.style.display='none'; return; }
+  const days=Math.round(dnum(todayStr())-Math.max(...autoDates));
+  if(days>=12){
+    el.href=WAKE_URL;
+    el.innerHTML='⚠ 股價已經 <b>'+days+' 天</b>沒自動更新，可能是 GitHub 排程休眠了。<br><span class="go">點我 → 進去按一下「Run workflow」就會恢復（之後又自動）</span>';
+    el.style.display='block';
+  }else el.style.display='none';
+}
+function renderAll(){ recordSnapshot(); renderCodePicker(); renderDash(); renderOverview(); renderTx(); renderPriceEditor(); renderCharts(); renderFreshness(); }
 
 /* ---------- 頁籤 ---------- */
 function go(pg){
