@@ -1,0 +1,16 @@
+{
+  "name": "存股 記帳",
+  "short_name": "存股",
+  "description": "私人存股與短期股票記帳、報酬率與淨值走勢，資料只留在手機。",
+  "lang": "zh-Hant",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f6f7f9",
+  "theme_color": "#ffffff",
+  "icons": [
+    { "src": "./icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "./icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "maskable" }
+  ]
+}
