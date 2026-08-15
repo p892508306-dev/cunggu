@@ -1,69 +1,53 @@
 /* ============================================================
-   抓台股「官方收盤價」→ 寫成 prices.json
-   在 GitHub Actions（伺服器端）執行，不受瀏覽器 CORS 限制。
+   抓台股「官方收盤價」→ 寫成 prices.json（GitHub Actions 執行）
 
-   來源（重點：要拿「當天最新」且用「資料本身的日期」貼標籤）：
-     上市 → 本家 www.twse STOCK_DAY_ALL（最新、含日期）
-             萬一失敗，退回 openapi.twse（可能慢一個交易日，但有日期）
-     上櫃 → 櫃買 TPEx openapi daily_close_quotes（最新、含日期）
+   為什麼要這樣設計？
+   - GitHub 的伺服器在美國，證交所本家 www.twse 常常「連不上」，
+     只能退回 openapi 鏡像，而該鏡像會慢一個交易日 → 盤後價不準。
+   - 解法：全市場用 openapi(上市)+TPEx(上櫃) 當「土台」；
+     「你實際持有的股票(watchlist.json)」再用 Yahoo Finance 抓「當日」最新，
+     覆蓋掉土台裡可能過期的值。Yahoo 美國連得到、且是當日收盤，最可靠。
+   - updated 以「真正抓到的最新日期」為準，不再盲貼今天。
 
-   為什麼要用資料日期？
-     證交所 openapi 鏡像常慢一個交易日；若盲目貼「今天」，會把昨天的
-     收盤價標成今天 → 看起來「不準」。改用資料裡的 Date 就永遠正確。
-   隱私：抓「全市場」收盤價，GitHub 不會知道你持有哪幾檔。
+   隱私：土台是全市場；watchlist 只是「代號清單」（GitHub 看得到你追哪幾檔，
+         但看不到你幾張、成本、損益——那些只在你手機）。
    ============================================================ */
 const fs = require('fs');
 
-async function getText(url){
-  const r = await fetch(url, { headers:{ 'User-Agent':'Mozilla/5.0 (stock-tracker)' } });
-  if(!r.ok) throw new Error(url + ' -> HTTP ' + r.status);
-  return r.text();
+async function getText(url, tries = 3){
+  let err;
+  for(let i = 0; i < tries; i++){
+    try{
+      const c = new AbortController();
+      const t = setTimeout(() => c.abort(), 20000);
+      const r = await fetch(url, { headers:{ 'User-Agent':'Mozilla/5.0 (stock-tracker)' }, signal:c.signal });
+      clearTimeout(t);
+      if(!r.ok) throw new Error('HTTP ' + r.status);
+      return await r.text();
+    }catch(e){ err = e; }
+  }
+  throw err;
 }
 const num = v => parseFloat(String(v ?? '').replace(/,/g,''));
-// 民國日期 "1150811" → "2026-08-11"
 function rocToISO(d){
   const s = String(d ?? '').trim().replace(/\//g,'');
   if(!/^\d{7}$/.test(s)) return null;
   return (Number(s.slice(0,3)) + 1911) + '-' + s.slice(3,5) + '-' + s.slice(5,7);
 }
+const tpeDate = ms => new Date(ms).toLocaleDateString('sv-SE', { timeZone:'Asia/Taipei' });
 
-// 解析一行 CSV（欄位用 "," 包住）→ 陣列
-function splitCsvLine(line){
-  const t = line.trim();
-  if(!t.startsWith('"')) return null;
-  return t.replace(/^"/,'').replace(/"\s*$/,'').split(/"\s*,\s*"/);
-}
-
-// ---- 上市：本家 www.twse（最新、含日期）----
-async function twseMain(){
-  const txt = await getText('https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=csv');
-  const out = {}; let date = null;
-  for(const line of txt.split('\n')){
-    const f = splitCsvLine(line);
-    // 欄位：日期,代號,名稱,股數,金額,開,高,低,收,漲跌,筆數
-    if(!f || f.length < 9) continue;
-    const iso = rocToISO(f[0]);
-    if(!iso) continue;                // 跳過標題與說明列
-    if(!date) date = iso;
-    const code = String(f[1]).trim(), close = num(f[8]);
-    if(code && isFinite(close) && close > 0) out[code] = close;
-  }
-  return { prices: out, date };
-}
-
-// ---- 上市備援：openapi.twse（可能慢一天，但有 Date）----
+// ---- 全市場土台：上市 openapi（美國連得到，可能慢一天）----
 async function twseOpenapi(){
   const j = JSON.parse(await getText('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL'));
   const out = {}; let date = null;
   for(const row of j){
     if(!date && row.Date) date = rocToISO(row.Date);
-    const code = row.Code, close = num(row.ClosingPrice);
-    if(code && isFinite(close) && close > 0) out[code] = close;
+    const close = num(row.ClosingPrice);
+    if(row.Code && isFinite(close) && close > 0) out[row.Code] = close;
   }
   return { prices: out, date };
 }
-
-// ---- 上櫃：TPEx openapi（最新、含 Date）----
+// ---- 全市場土台：上櫃 TPEx openapi（通常最新）----
 async function tpex(){
   const j = JSON.parse(await getText('https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes'));
   const out = {}; let date = null;
@@ -75,36 +59,49 @@ async function tpex(){
   }
   return { prices: out, date };
 }
+// ---- 持有股：Yahoo Finance（美國連得到、當日收盤）----
+async function yahoo(sym){
+  const j = JSON.parse(await getText('https://query1.finance.yahoo.com/v8/finance/chart/' + sym + '?interval=1d&range=1d'));
+  const m = j?.chart?.result?.[0]?.meta;
+  if(!m || !isFinite(m.regularMarketPrice) || m.regularMarketPrice <= 0) return null;
+  return { price: m.regularMarketPrice, time: m.regularMarketTime ? m.regularMarketTime * 1000 : null };
+}
 
 (async () => {
-  const prices = {}; const dates = [];
+  const prices = {}; const baseDates = [];
 
-  // 上市：先本家（最新），不行才退回 openapi
-  try{
-    let t = await twseMain();
-    if(Object.keys(t.prices).length < 100){ throw new Error('本家筆數過少 ' + Object.keys(t.prices).length); }
-    Object.assign(prices, t.prices); if(t.date) dates.push(t.date);
-    console.log('上市 www.twse OK：', Object.keys(t.prices).length, '檔，日期', t.date);
-  }catch(e){
-    console.error('上市本家失敗，改用 openapi：', e.message);
-    try{ const t = await twseOpenapi(); Object.assign(prices, t.prices); if(t.date) dates.push(t.date);
-      console.log('上市 openapi OK：', Object.keys(t.prices).length, '檔，日期', t.date, '（可能慢一個交易日）');
-    }catch(e2){ console.error('上市 openapi 也失敗：', e2.message); }
-  }
-
-  // 上櫃
-  try{ const t = await tpex(); Object.assign(prices, t.prices); if(t.date) dates.push(t.date);
-    console.log('上櫃 TPEx OK：', Object.keys(t.prices).length, '檔，日期', t.date);
+  // 1) 土台（全市場）
+  try{ const t = await twseOpenapi(); Object.assign(prices, t.prices); if(t.date) baseDates.push(t.date);
+    console.log('上市 openapi：', Object.keys(t.prices).length, '檔，日期', t.date);
+  }catch(e){ console.error('上市 openapi 失敗：', e.message); }
+  try{ const t = await tpex(); Object.assign(prices, t.prices); if(t.date) baseDates.push(t.date);
+    console.log('上櫃 TPEx：', Object.keys(t.prices).length, '檔，日期', t.date);
   }catch(e){ console.error('上櫃 TPEx 失敗：', e.message); }
 
-  // 安全閥：抓到太少就中止，不要用垃圾覆蓋掉上一份好資料
-  const n = Object.keys(prices).length;
-  if(n < 100){ console.error('只抓到', n, '筆，疑似來源異常，中止。'); process.exit(1); }
+  if(Object.keys(prices).length < 100){ console.error('土台抓太少，中止。'); process.exit(1); }
 
-  // 以「資料本身的日期」為準（取最新的那個）；真的都沒有才退回台灣今天
-  const updated = dates.filter(Boolean).sort().pop()
+  // 2) 持有股用 Yahoo 覆蓋成「當日最新」
+  let watch = [];
+  try{ watch = JSON.parse(fs.readFileSync('watchlist.json','utf8')); }catch(e){}
+  let freshDate = null, freshN = 0;
+  for(const code of watch){
+    let r = null;
+    try{ r = await yahoo(code + '.TW'); }catch(e){}
+    if(!r){ try{ r = await yahoo(code + '.TWO'); }catch(e){} }   // 上櫃用 .TWO
+    if(r){
+      prices[code] = r.price; freshN++;
+      if(r.time){ const d = tpeDate(r.time); if(!freshDate || d > freshDate) freshDate = d; }
+      console.log('Yahoo 最新：', code, '=', r.price, r.time ? '('+tpeDate(r.time)+')' : '');
+    }else{
+      console.error('Yahoo 抓不到：', code, '（保留土台值）');
+    }
+  }
+
+  // 3) updated：優先用 Yahoo 的當日日期；沒有才用土台最新日期；再沒有才台灣今天
+  const updated = freshDate
+    || baseDates.filter(Boolean).sort().pop()
     || new Date().toLocaleDateString('sv-SE', { timeZone:'Asia/Taipei' });
 
   fs.writeFileSync('prices.json', JSON.stringify({ updated, prices }));
-  console.log('已寫入 prices.json：', n, '檔，資料日期', updated);
+  console.log('已寫入 prices.json：', Object.keys(prices).length, '檔，持有股新鮮', freshN, '檔，日期', updated);
 })();
